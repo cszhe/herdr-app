@@ -1,17 +1,18 @@
 # Fork-only: an Intel macOS build of the app, which upstream does not ship
 # (herdrdev/herdr-app#140). A copy of release.yml's macOS build job on the
 # x86_64 runner; scripts/package has its Intel refusal removed on this branch.
-# Ad hoc signed (no Apple certificate), uploaded as a workflow artifact.
+# Ad hoc signed (no Apple certificate), uploaded as a workflow artifact; a
+# `v<version>-intel` tag also publishes it as a GitHub Release on the fork.
 name: intel mac
 
 on:
   workflow_dispatch:
   push:
     branches: [intel-mac]
-    tags: ["v*"]
+    tags: ["v*-intel"]
 
 permissions:
-  contents: read
+  contents: write # releases on tags
 
 concurrency:
   group: intel-mac-${{ github.ref }}
@@ -53,6 +54,11 @@ jobs:
           restore-keys: |
             intel-mac-v1-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-${{ hashFiles('Cargo.lock') }}-
             intel-mac-v1-${{ env.RUST_TOOLCHAIN }}-zig${{ env.ZIG_VERSION }}-
+      - name: Version matches the tag
+        if: github.ref_type == 'tag'
+        run: |
+          want="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-intel"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $want"; exit 1; }
       - name: Keep unchanged sources fresh
         run: scripts/ci-sources restore
       - name: Build and pack
@@ -64,7 +70,7 @@ jobs:
           file dist/Herdr.app/Contents/MacOS/Herdr | tee /dev/stderr | grep -q x86_64
           codesign --verify --deep --strict dist/Herdr.app
           tar -xOf "$archive" Herdr.app/Contents/Resources/THIRD-PARTY-NOTICES | cmp - THIRD-PARTY-NOTICES
-          shasum -a 256 "$archive" | tee -a "$GITHUB_STEP_SUMMARY"
+          (cd dist && shasum -a 256 herdr-app-macos-x86_64.tar.gz | tee SHA256SUMS >> "$GITHUB_STEP_SUMMARY")
       - name: Note the sources the cache was built from
         if: steps.cache.outputs.cache-hit != 'true'
         run: scripts/ci-sources record
@@ -80,3 +86,32 @@ jobs:
           path: dist/herdr-app-macos-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 30
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}; version=${version%-intel}
+          cat > notes.md <<EOF
+          **Unofficial** build of [Herdr](https://github.com/herdrdev/herdr-app) $version for Intel (x86_64) Macs.
+          Upstream ships Apple Silicon only ([herdrdev/herdr-app#140](https://github.com/herdrdev/herdr-app/issues/140)); this is the same source, built by [this fork's GitHub Action](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) on \`macos-15-intel\`.
+          Changes: [upstream changelog](https://github.com/herdrdev/herdr-app/blob/v$version/CHANGELOG.md).
+
+          ## Install
+
+          \`\`\`sh
+          tar -xzf herdr-app-macos-x86_64.tar.gz
+          mv Herdr.app ~/Applications/   # or /Applications
+          xattr -dr com.apple.quarantine ~/Applications/Herdr.app
+          \`\`\`
+
+          The app is ad hoc signed, not notarised: without the \`xattr\` line macOS refuses to open it (use System Settings > Privacy & Security > Open Anyway instead). On first start the app offers to install the Herdr core (\`hc\`), which upstream does publish for Intel Macs. The app does not update itself; come back here for new versions.
+
+          ## Verify
+
+          \`\`\`sh
+          shasum -a 256 -c SHA256SUMS
+          \`\`\`
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/herdr-app-macos-x86_64.tar.gz dist/SHA256SUMS \
+            --title "Herdr $version for Intel Macs (unofficial)" --notes-file notes.md --latest
