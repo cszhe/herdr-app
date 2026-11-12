@@ -112,6 +112,31 @@ pub struct Frame {
     /// own): where input methods put their candidate window.
     pub cursor_cell: Option<(u16, u16)>,
     pub bg: Rgb,
+    /// Search highlights on the current viewport, already converted from
+    /// Ghostty's short-lived grid references into cell coordinates.
+    pub search_spans: Vec<SearchSpan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchSpan {
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
+    pub selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchProgress {
+    pub total: usize,
+    /// Zero-based index in Ghostty's newest-to-oldest ordering.
+    pub selected: Option<usize>,
+    pub complete: bool,
+}
+
+impl Default for SearchProgress {
+    fn default() -> Self {
+        Self { total: 0, selected: None, complete: true }
+    }
 }
 
 /// Holds what the terminal's callbacks write into; boxed so its address is stable.
@@ -450,6 +475,11 @@ fn install_png_decoder() {
 
 pub struct Vt {
     term: GhosttyTerminal,
+    /// Created lazily when a find bar opens; each terminal owns its own search.
+    search: Option<GhosttySearch>,
+    search_active: bool,
+    search_progress: SearchProgress,
+    search_spans: Vec<SearchSpan>,
     shared: Box<Shared>,
     rows_it: GhosttyRenderStateRowIterator,
     cells: GhosttyRenderStateRowCells,
@@ -565,6 +595,16 @@ fn hyperlink_uri(r: &GhosttyGridRef) -> Option<String> {
     (res == GHOSTTY_SUCCESS && len > 0).then(|| String::from_utf8_lossy(&buf[..len]).into_owned())
 }
 
+fn is_wide(r: &GhosttyGridRef) -> bool {
+    let mut cell: GhosttyCell = Default::default();
+    let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+    let read = unsafe {
+        ghostty_grid_ref_cell(r, &mut cell) == GHOSTTY_SUCCESS
+            && ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
+    };
+    read && wide == GHOSTTY_CELL_WIDE_WIDE
+}
+
 #[derive(Clone, Copy)]
 pub enum Select {
     Press,
@@ -675,6 +715,10 @@ impl Vt {
             );
             let mut vt = Vt {
                 term,
+                search: None,
+                search_active: false,
+                search_progress: SearchProgress::default(),
+                search_spans: Vec::new(),
                 shared,
                 rows_it,
                 cells,
@@ -967,6 +1011,18 @@ impl Vt {
         }
     }
 
+    /// Select the active screen and its history without formatting or copying text.
+    pub fn select_all(&mut self) {
+        let mut selection = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+        unsafe {
+            if ghostty_terminal_select_all(self.term, &mut selection) == GHOSTTY_SUCCESS {
+                ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &selection as *const _ as *const c_void);
+            } else {
+                self.clear_selection();
+            }
+        }
+    }
+
     /// The selected text, if anything is selected.
     pub fn selection_text(&self) -> Option<String> {
         unsafe {
@@ -1176,6 +1232,7 @@ impl Vt {
         self.placements_cache.get_mut().take();
         self.win32.watch(bytes);
         unsafe { ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len()) };
+        self.feed_search();
     }
 
     pub fn allow_clipboard_write(&mut self, allow: bool) {
@@ -1195,6 +1252,7 @@ impl Vt {
         self.rows = rows;
         self.shared.size = GhosttySizeReportSize { rows, columns: cols, cell_width: cell_w.max(1), cell_height: cell_h.max(1) };
         unsafe { ghostty_terminal_resize(self.term, cols, rows, cell_w.max(1), cell_h.max(1)) };
+        self.feed_search();
     }
 
     pub fn take_title(&mut self) -> Option<String> {
@@ -1243,12 +1301,196 @@ impl Vt {
         let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_DELTA, ..Default::default() };
         s.value.delta = delta;
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
+        self.feed_search();
+    }
+
+    /// Scrolls so `row` (from the scrollback's top) is the first visible row.
+    pub fn scroll_to_row(&mut self, row: usize) {
+        self.placements_cache.get_mut().take();
+        let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_ROW, ..Default::default() };
+        s.value.row = row;
+        unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
+        self.feed_search();
+    }
+
+    /// What a scrollbar needs: the scrollable area's total rows, the viewport's
+    /// offset into it, and the viewport's length.
+    pub fn scrollbar(&self) -> GhosttyTerminalScrollbar {
+        let mut sb = GhosttyTerminalScrollbar::default();
+        unsafe { ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &mut sb as *mut _ as *mut c_void) };
+        sb
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.placements_cache.get_mut().take();
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
+        self.feed_search();
+    }
+
+    /// Start (or reuse) this terminal's Ghostty search. The handle belongs to
+    /// this Vt, so searches never leak between terminal tabs or panes.
+    pub fn start_search(&mut self, needle: &str) {
+        if self.search.is_none() {
+            let mut search = std::ptr::null_mut();
+            let result = unsafe { ghostty_search_new(std::ptr::null(), &mut search, self.term) };
+            if result != GHOSTTY_SUCCESS || search.is_null() {
+                tracing::warn!("terminal search: ghostty_search_new failed: {result:?}");
+                return;
+            }
+            self.search = Some(search);
+        }
+        self.set_search_needle(needle);
+    }
+
+    pub fn set_search_needle(&mut self, needle: &str) {
+        let Some(search) = self.search else { return };
+        self.search_active = !needle.is_empty();
+        let value = GhosttyString { ptr: needle.as_ptr(), len: needle.len() };
+        let value = if needle.is_empty() { std::ptr::null() } else { &value as *const _ as *const c_void };
+        let result = unsafe { ghostty_search_set(search, GHOSTTY_SEARCH_OPT_NEEDLE, value) };
+        if result != GHOSTTY_SUCCESS {
+            return;
+        }
+        if self.search_active {
+            self.feed_search();
+            self.progress_search();
+        } else {
+            self.search_progress = SearchProgress::default();
+            self.search_spans.clear();
+        }
+    }
+
+    pub fn clear_search(&mut self) {
+        self.set_search_needle("");
+    }
+
+    pub fn search_progress(&self) -> SearchProgress {
+        self.search_progress
+    }
+
+    /// Make one bounded unit of progress. Interactive searches must not call
+    /// Ghostty's blocking `run` on the UI thread.
+    pub fn progress_search(&mut self) -> bool {
+        let Some(search) = self.search.filter(|_| self.search_active) else { return false };
+        let before = (self.search_progress, self.search_spans.clone());
+        let mut status = GHOSTTY_SEARCH_STATUS_COMPLETE;
+        unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_STATUS, &mut status as *mut _ as *mut c_void); }
+        if status == GHOSTTY_SEARCH_STATUS_FEED_REQUIRED {
+            self.feed_search();
+        }
+        let result = unsafe { ghostty_search_tick(search, &mut status) };
+        if result == GHOSTTY_SUCCESS {
+            self.read_search_data(search, status);
+        }
+        before != (self.search_progress, self.search_spans.clone())
+    }
+
+    /// Navigate only after incremental indexing is complete; the Ghostty
+    /// select API catches up synchronously, so calling it early could stall UI.
+    pub fn search_navigate(&mut self, previous: bool) -> bool {
+        let Some(search) = self.search.filter(|_| self.search_active && self.search_progress.complete) else { return false };
+        let option = if previous { GHOSTTY_SEARCH_OPT_SELECT_PREV } else { GHOSTTY_SEARCH_OPT_SELECT_NEXT };
+        if unsafe { ghostty_search_set(search, option, std::ptr::null()) } != GHOSTTY_SUCCESS {
+            return false;
+        }
+        self.feed_search();
+        true
+    }
+
+    fn feed_search(&mut self) {
+        let Some(search) = self.search.filter(|_| self.search_active) else { return };
+        if unsafe { ghostty_search_feed(search) } != GHOSTTY_SUCCESS {
+            return;
+        }
+        let mut status = GHOSTTY_SEARCH_STATUS_COMPLETE;
+        unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_STATUS, &mut status as *mut _ as *mut c_void); }
+        self.read_search_data(search, status);
+    }
+
+    fn read_search_data(&mut self, search: GhosttySearch, status: GhosttySearchStatus) {
+        let mut total = 0usize;
+        let _ = unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_TOTAL_MATCHES, &mut total as *mut _ as *mut c_void) };
+        let mut selected_index = 0usize;
+        let selected = unsafe {
+            ghostty_search_get(search, GHOSTTY_SEARCH_DATA_SELECTED_INDEX, &mut selected_index as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
+        }.then_some(selected_index);
+        self.search_progress = SearchProgress { total, selected, complete: status == GHOSTTY_SEARCH_STATUS_COMPLETE };
+
+        // Ghostty returns viewport-only snapshots, not pointers into terminal
+        // state. Convert them immediately: any later terminal mutation makes
+        // the grid refs stale.
+        let mut buffer = GhosttySelectionBuffer { ptr: std::ptr::null_mut(), cap: 0, len: 0 };
+        let result = unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &mut buffer as *mut _ as *mut c_void) };
+        let mut matches = Vec::new();
+        if result == GHOSTTY_OUT_OF_SPACE && buffer.len > 0 {
+            matches = std::iter::repeat_with(|| GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() })
+                .take(buffer.len)
+                .collect();
+            buffer.ptr = matches.as_mut_ptr();
+            buffer.cap = matches.len();
+            buffer.len = 0;
+            if unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_VIEWPORT_MATCHES, &mut buffer as *mut _ as *mut c_void) } != GHOSTTY_SUCCESS {
+                self.search_spans.clear();
+                return;
+            }
+        } else if result != GHOSTTY_SUCCESS {
+            self.search_spans.clear();
+            return;
+        }
+
+        let mut selected_match = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() };
+        let has_selected_match = unsafe {
+            ghostty_search_get(search, GHOSTTY_SEARCH_DATA_SELECTED_MATCH, &mut selected_match as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
+        };
+        let mut spans = Vec::new();
+        for matched in matches.iter().take(buffer.len) {
+            let selected = if has_selected_match {
+                let mut equal = false;
+                unsafe { ghostty_terminal_selection_equal(self.term, matched, &selected_match, &mut equal); }
+                equal
+            } else {
+                false
+            };
+            let mut start = GhosttyPointCoordinate::default();
+            let mut end = GhosttyPointCoordinate::default();
+            let (start_ok, end_ok) = unsafe {
+                (
+                    ghostty_terminal_point_from_grid_ref(self.term, &matched.start, GHOSTTY_POINT_TAG_VIEWPORT, &mut start),
+                    ghostty_terminal_point_from_grid_ref(self.term, &matched.end, GHOSTTY_POINT_TAG_VIEWPORT, &mut end),
+                )
+            };
+            if start_ok != GHOSTTY_SUCCESS || end_ok != GHOSTTY_SUCCESS {
+                continue;
+            }
+            let swapped = (start.y, start.x) > (end.y, end.x);
+            if swapped {
+                std::mem::swap(&mut start, &mut end);
+            }
+            // A match ends on a wide character's first cell; cover its second too.
+            if is_wide(if swapped { &matched.start } else { &matched.end }) {
+                end.x += 1;
+            }
+            let last_row = end.y.min(self.rows.saturating_sub(1) as u32);
+            if start.y >= self.rows as u32 || start.y > last_row {
+                continue;
+            }
+            for row in start.y..=last_row {
+                let first = if row == start.y { start.x } else { 0 };
+                let last = if row == end.y { end.x } else { self.cols.saturating_sub(1) };
+                if first <= last && first < self.cols {
+                    spans.push(SearchSpan { row: row as u16, start: first, end: last.min(self.cols.saturating_sub(1)), selected });
+                }
+            }
+        }
+        self.search_spans = spans;
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.placements_cache.get_mut().take();
+        let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_TOP, ..Default::default() };
+        unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
+        self.feed_search();
     }
 
     /// Wraps pasted text the way the program asked (bracketed paste or not).
@@ -1298,6 +1540,10 @@ impl Vt {
             }
             (cursor, generation, colors)
         }
+    }
+
+    pub fn render_hold_deadline(&self) -> Option<Instant> {
+        self.shared.held_since.map(|since| since + MAX_HOLD)
     }
 
     /// Updates the render state (respecting synchronized output) and reads one frame.
@@ -1380,7 +1626,7 @@ impl Vt {
             self.drawn = self.drawable();
             ghostty_render_state_clean(state);
             let cursor_cell = cur.viewport_has_value.then_some((cur.viewport_x, cur.viewport_y));
-            Frame { rows, all, cursor, cursor_cell, bg: bg_default }
+            Frame { rows, all, cursor, cursor_cell, bg: bg_default, search_spans: self.search_spans.clone() }
         }
     }
 
@@ -1544,9 +1790,23 @@ impl Vt {
             if action == GHOSTTY_MOUSE_ACTION_MOTION && self.last_mouse_report == buf[..len] {
                 return Vec::new();
             }
+            let report = buf[..len].to_vec();
+            // Remember the motion equivalent of a press/release, so a focus click
+            // cannot start a drag at the same cell. Let the encoder handle each
+            // format's coordinates, including the finer SGR-pixel positions.
+            if action != GHOSTTY_MOUSE_ACTION_MOTION {
+                ghostty_mouse_event_set_action(e, GHOSTTY_MOUSE_ACTION_MOTION);
+                if action == GHOSTTY_MOUSE_ACTION_RELEASE {
+                    ghostty_mouse_event_clear_button(e);
+                }
+                len = 0;
+                if ghostty_mouse_encoder_encode(self.mouse, e, buf.as_mut_ptr() as *mut _, buf.len(), &mut len) != GHOSTTY_SUCCESS {
+                    len = 0;
+                }
+            }
             self.last_mouse_report.clear();
             self.last_mouse_report.extend_from_slice(&buf[..len]);
-            buf[..len].to_vec()
+            report
         }
     }
 }
@@ -1554,6 +1814,9 @@ impl Vt {
 impl Drop for Vt {
     fn drop(&mut self) {
         unsafe {
+            if let Some(search) = self.search {
+                ghostty_search_free(search);
+            }
             ghostty_selection_gesture_event_free(self.press);
             ghostty_selection_gesture_event_free(self.drag);
             ghostty_selection_gesture_event_free(self.release);
@@ -1573,6 +1836,91 @@ impl Drop for Vt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn finish_search(vt: &mut Vt) {
+        for _ in 0..100_000 {
+            if vt.search_progress().complete {
+                return;
+            }
+            vt.progress_search();
+        }
+        panic!("terminal search did not finish incrementally");
+    }
+
+    #[test]
+    fn terminal_search_matches_case_insensitively_and_wraps_navigation() {
+        let mut vt = Vt::new(32, 4);
+        vt.write(b"Needle here\r\nnot this\r\nneedle again");
+        vt.select(Select::Press, 0, 0, 1.0, 5.0, 10.0, 40.0);
+        vt.select(Select::Drag, 5, 0, 60.0, 5.0, 10.0, 40.0);
+        vt.select(Select::Release, 5, 0, 60.0, 5.0, 10.0, 40.0);
+        let clipboard_selection = vt.selection_text();
+        assert!(clipboard_selection.is_some());
+        vt.start_search("needle");
+        finish_search(&mut vt);
+
+        assert_eq!(vt.search_progress().total, 2);
+        assert_eq!(vt.search_progress().selected, None);
+        assert_eq!(vt.search_spans.len(), 2);
+        assert!(vt.search_spans.iter().all(|span| !span.selected));
+
+        assert!(vt.search_navigate(false));
+        assert_eq!(vt.search_progress().selected, Some(0));
+        assert!(vt.search_spans.iter().any(|span| span.selected));
+        assert_eq!(vt.selection_text(), clipboard_selection, "search doesn't replace the user's copy selection");
+        assert!(vt.search_navigate(false));
+        assert_eq!(vt.search_progress().selected, Some(1));
+        assert!(vt.search_navigate(false));
+        assert_eq!(vt.search_progress().selected, Some(0), "next wraps to newest");
+        assert!(vt.search_navigate(true));
+        assert_eq!(vt.search_progress().selected, Some(1), "previous wraps to oldest");
+
+        vt.clear_search();
+        assert_eq!(vt.search_progress(), SearchProgress::default());
+        assert!(vt.search_spans.is_empty());
+    }
+
+    #[test]
+    fn terminal_search_covers_scrollback_and_its_state_is_per_terminal() {
+        let mut first = Vt::new(32, 3);
+        let mut second = Vt::new(32, 3);
+        for line in 0..10 {
+            first.write(format!("first-{line}\r\n").as_bytes());
+            second.write(format!("second-{line}\r\n").as_bytes());
+        }
+
+        first.start_search("first-0");
+        second.start_search("second-9");
+        finish_search(&mut first);
+        finish_search(&mut second);
+        assert_eq!(first.search_progress().total, 1);
+        assert_eq!(second.search_progress().total, 1);
+        assert!(first.search_spans.is_empty(), "old scrollback isn't in the viewport yet");
+        let second_spans = second.search_spans.clone();
+        assert!(!second_spans.is_empty(), "the second terminal's current match is visible");
+
+        assert!(first.search_navigate(false));
+        assert!(!first.search_spans.is_empty(), "selecting a history result scrolls it into view");
+        assert!(first.search_spans.iter().all(|span| span.selected));
+        assert_eq!(second.search_spans, second_spans, "searching one terminal doesn't draw in another");
+    }
+
+    #[test]
+    fn terminal_search_highlights_both_cells_of_a_wide_character() {
+        let spans = |cols: u16, text: &str, query: &str| {
+            let mut vt = Vt::new(cols, 3);
+            vt.write(text.as_bytes());
+            vt.start_search(query);
+            finish_search(&mut vt);
+            vt.search_spans.iter().map(|span| (span.row, span.start, span.end)).collect::<Vec<_>>()
+        };
+        assert_eq!(spans(20, "日本語 ab", "本"), vec![(0, 2, 3)]);
+        assert_eq!(spans(20, "日本語 ab", "日本"), vec![(0, 0, 3)]);
+        assert_eq!(spans(20, "x😀y", "😀"), vec![(0, 1, 2)]);
+        assert_eq!(spans(6, "abcd日", "日"), vec![(0, 4, 5)], "in the last two columns");
+        assert_eq!(spans(5, "abcd日", "d日"), vec![(0, 3, 4), (1, 0, 1)], "wrapped to the next row");
+        assert_eq!(spans(20, "日本語 ab", "語 a"), vec![(0, 4, 7)], "a narrow end keeps its own cell");
+    }
 
     #[test]
     fn scrollback_retains_five_thousand_styled_lines() {
@@ -1601,6 +1949,20 @@ mod tests {
         assert!(f.rows[0][0].wide, "also after a reset");
         assert_eq!(f.rows[0][0].text, "\u{270d}\u{fe0f}");
         assert_eq!(f.rows[0][2].text, "!");
+    }
+
+    #[test]
+    fn synchronized_output_releases_at_its_deadline() {
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"before");
+        vt.write(b"\x1b[?2026h\r\x1b[Kafter");
+        let text = |frame: Frame| frame.rows[0].iter().map(|c| c.text.as_str()).collect::<String>();
+        assert!(text(vt.frame()).starts_with("before"));
+        let since = Instant::now() - MAX_HOLD - Duration::from_millis(1);
+        vt.shared.held_since = Some(since);
+        assert_eq!(vt.render_hold_deadline(), Some(since + MAX_HOLD));
+        assert!(text(vt.frame()).starts_with("after"));
+        assert_eq!(vt.render_hold_deadline(), None);
     }
 
     #[test]
@@ -1805,11 +2167,99 @@ mod tests {
     }
 
     #[test]
+    fn mouse_clicks_do_not_report_same_cell_drags_in_any_cell_encoding() {
+        let size = (80, 2, 11.7, 20.0);
+        for tracking in [b"\x1b[?1002h".as_slice(), b"\x1b[?1003h"] {
+            for format in [b"".as_slice(), b"\x1b[?1005h", b"\x1b[?1006h", b"\x1b[?1015h"] {
+                let mut vt = Vt::new(80, 2);
+                vt.write(tracking);
+                vt.write(format);
+                let left = Some(GHOSTTY_MOUSE_BUTTON_LEFT);
+                for _ in 0..2 {
+                    assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, left, 0, 15.0, 5.0, size, true).is_empty());
+                    assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 15.0, 5.0, size, true).is_empty());
+                    assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 16.0, 6.0, size, true).is_empty());
+                    assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_RELEASE, left, 0, 16.0, 6.0, size, false).is_empty());
+                    assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, None, 0, 16.0, 6.0, size, false).is_empty());
+                }
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, left, 0, 15.0, 5.0, size, true).is_empty());
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 25.0, 5.0, size, true).is_empty());
+                assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 26.0, 6.0, size, true).is_empty());
+                // Another button can report at the same cell; press/release are never filtered.
+                let right = Some(GHOSTTY_MOUSE_BUTTON_RIGHT);
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, right, 0, 25.0, 5.0, size, true).is_empty());
+                assert!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, right, 0, 26.0, 6.0, size, true).is_empty());
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, left, 0, 26.0, 6.0, size, true).is_empty());
+                assert!(!vt.encode_mouse(GHOSTTY_MOUSE_ACTION_RELEASE, right, 0, 26.0, 6.0, size, true).is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn button_motion_needs_the_views_press_ownership_gate() {
         let mut vt = Vt::new(80, 2);
         vt.write(b"\x1b[?1002h\x1b[?1006h");
         // Ghostty trusts the event's button even if this pane never saw a press.
         assert_eq!(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_MOTION, Some(GHOSTTY_MOUSE_BUTTON_LEFT), 0, 35.0, 5.0, (80, 2, 10.0, 20.0), false), b"\x1b[<32;4;1M");
+    }
+
+    #[test]
+    fn select_all_covers_history_and_screen_from_any_viewport() {
+        let mut vt = Vt::new(12, 2);
+        vt.write("old 日本語\r\nwrapped abcdefghijklmnop\r\nlast".as_bytes());
+        for scroll in [0, -100, 1] {
+            vt.scroll_viewport(scroll);
+            vt.select_all();
+            assert_eq!(vt.selection_text().as_deref(), Some("old 日本語\nwrapped abcdefghijklmnop\nlast"));
+            vt.clear_selection();
+            assert_eq!(vt.selection_text(), None);
+        }
+    }
+
+    #[test]
+    fn select_all_uses_only_the_active_screen() {
+        let mut vt = Vt::new(20, 3);
+        vt.select_all();
+        assert_eq!(vt.selection_text(), None);
+        vt.write(b"primary history\r\nprimary screen\x1b[?1049h\x1b[Halt only");
+        vt.select_all();
+        assert_eq!(vt.selection_text().as_deref(), Some("alt only"));
+        vt.write(b"\x1b[?1049l");
+        vt.select_all();
+        assert_eq!(vt.selection_text().as_deref(), Some("primary history\nprimary screen"));
+        vt.select(Select::Press, 0, 0, 2.0, 5.0, 10.0, 60.0);
+        assert_eq!(vt.selection_text(), None, "a plain click clears select-all too");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual 64 MiB scrollback performance check"]
+    fn select_all_large_scrollback() {
+        let mut vt = Vt::new(80, 25);
+        let bytes = 64usize * 1024 * 1024;
+        let lines = usize::MAX;
+        unsafe {
+            ok(ghostty_terminal_set(vt.term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, &bytes as *const _ as *const c_void), "scrollback bytes");
+            ok(ghostty_terminal_set(vt.term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &lines as *const _ as *const c_void), "scrollback lines");
+        }
+        let line = format!("{}\r\n", "x".repeat(79));
+        for _ in 0..200_000 {
+            vt.write(line.as_bytes());
+        }
+        let memory = || {
+            std::fs::read_to_string("/proc/self/status").unwrap().lines()
+                .find(|line| line.starts_with("VmRSS:")).unwrap().to_owned()
+        };
+        let before = memory();
+        let started = Instant::now();
+        for _ in 0..1000 {
+            vt.select_all();
+        }
+        eprintln!("64 MiB budget, {} rows; 1000 selections: {:?}; RSS before {before}, after {}", vt.scrollbar().total, started.elapsed(), memory());
+        let text = vt.selection_text().unwrap();
+        assert!(text.starts_with(&"x".repeat(79)));
+        assert!(text.trim_end().ends_with(&"x".repeat(79)));
+        eprintln!("copy on request: {} bytes", text.len());
     }
 
     #[test]
@@ -2182,5 +2632,46 @@ mod tests {
         vt.write(b"\x1b]2;hello\x07");
         assert_eq!(vt.take_title().as_deref(), Some("hello"));
         assert_eq!(vt.take_title(), None);
+    }
+
+    #[test]
+    fn absolute_scroll_refreshes_search_highlights_across_pages() {
+        let mut vt = Vt::new(80, 24);
+        vt.write(b"ONLY TOP NEEDLE\r\n");
+        for line in 1..=2000 {
+            vt.write(format!("nonmatching line {line}\r\n").as_bytes());
+        }
+        vt.start_search("NEEDLE");
+        finish_search(&mut vt);
+        assert_eq!(vt.search_progress().total, 1);
+        assert!(vt.search_spans.is_empty());
+
+        vt.scroll_to_row(0);
+        assert_eq!(vt.search_spans.len(), 1);
+        assert_eq!(vt.search_spans[0].row, 0);
+        for row in [500, 1000, 1500] {
+            vt.scroll_to_row(row);
+            assert!(vt.search_spans.is_empty(), "stale highlights at row {row}");
+            vt.scroll_to_top();
+            assert_eq!(vt.search_spans.len(), 1, "missing top highlight after row {row}");
+            assert_eq!(vt.search_spans[0].row, 0);
+        }
+    }
+
+    #[test]
+    fn scroll_to_top_reaches_the_oldest_line_and_bottom_returns() {
+        let mut vt = Vt::new(20, 5);
+        for line in 1..=50 {
+            vt.write(format!("{line:04}\r\n").as_bytes());
+        }
+        let visible = |vt: &mut Vt| -> Vec<String> {
+            vt.frame().rows.iter().map(|row| row.iter().map(|c| c.text.as_str()).collect::<String>()).collect()
+        };
+        vt.scroll_to_top();
+        let top = visible(&mut vt);
+        assert!(top[0].starts_with("0001"), "{top:?}");
+        vt.scroll_to_bottom();
+        let bottom = visible(&mut vt);
+        assert!(bottom.iter().any(|row| row.starts_with("0050")), "{bottom:?}");
     }
 }
